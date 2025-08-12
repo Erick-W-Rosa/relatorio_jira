@@ -1,41 +1,3 @@
-"""
-API Flask para gerar um relatório em Excel com tarefas concluídas nos últimos 30 dias
-(e/ou em uma janela configurável), e enviar o arquivo por e-mail. Inclui endpoints
-para execução sob demanda e para agendar execuções recorrentes (mensal/diária) via APScheduler.
-
-Requisitos (requirements.txt):
-Flask==3.0.3
-APScheduler==3.10.4
-pandas==2.2.2
-openpyxl==3.1.5
-requests==2.32.3
-python-dateutil==2.9.0.post0
-
-Execução local:
-export FLASK_ENV=development
-export SMTP_HOST=smtp.gmail.com
-export SMTP_PORT=587
-export SMTP_USER="jira.coasul@gmail.com"
-export SMTP_PASS="<sua_senha_ou_app_password>"
-export EMAIL_FROM="jira.coasul@gmail.com"
-export EMAIL_TO="dest1@empresa.com,dest2@empresa.com"
-# (Opcional) Integração com Jira Cloud/Data Center
-export JIRA_BASE_URL="https://<sua_instancia>.atlassian.net"  # ou URL DC
-export JIRA_USER="<seu_email_no_jira>"
-export JIRA_TOKEN="<api_token_ou_senha>"
-# JQL padrão: concluídas nos últimos 30 dias
-export JIRA_JQL="statusCategory = Done AND resolved >= -30d ORDER BY resolved DESC"
-
-python api_relatorio_tarefas.py
-
-Endpoints:
-GET  /health                          -> status
-POST /report/run                      -> executa agora; body opcional para override de parâmetros
-POST /schedule/monthly                -> agenda por dia do mês e horário
-POST /schedule/daily                  -> agenda diária em horário específico
-DELETE /schedule/<job_id>             -> remove agendamento
-GET  /schedule                         -> lista agendamentos
-"""
 from __future__ import annotations
 
 import io
@@ -380,3 +342,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     logger.info("Iniciando API na porta %d (TZ=%s)...", port, TZ)
     app.run(host="0.0.0.0", port=port)
+
