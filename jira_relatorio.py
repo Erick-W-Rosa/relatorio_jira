@@ -1,8 +1,8 @@
 # jira_relatorio.py
 """
-API Flask para gerar relatório em Excel com tarefas concluídas nos últimos N dias
-e enviar por e-mail. Integração opcional com Jira (via JQL).
-Compatível com Python 3.13.
+API Flask para gerar relatório em Excel (últimos N dias) de um projeto do Jira,
+enviar por e-mail, e com Excel já formatado (títulos PT-BR, layout moderno e
+datas/hora em pt-BR). Compatível com Python 3.13.
 """
 
 from __future__ import annotations
@@ -46,10 +46,14 @@ EMAIL_TO_DEFAULT = [e.strip() for e in os.getenv("EMAIL_TO", "").split(",") if e
 JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
 JIRA_USER = os.getenv("JIRA_USER")
 JIRA_TOKEN = os.getenv("JIRA_TOKEN")
-# JQL **como string** (não remova as aspas)
-JIRA_JQL_DEFAULT = os.getenv(
-    "JIRA_JQL",
-    "statusCategory = Done AND resolved >= -30d ORDER BY resolved DESC",
+
+# Projeto padrão (ID do projeto/KEY do Jira)
+PROJECT_KEY = os.getenv("PROJECT_KEY", "IDT")
+
+# JQL base (STRING!). Usamos PROJECT_KEY e janela dinâmica de dias.
+JIRA_JQL_TEMPLATE = os.getenv(
+    "JIRA_JQL_TEMPLATE",
+    'project = {project} AND statusCategory = Done AND resolved >= -{days}d ORDER BY resolved DESC',
 )
 
 app = Flask(__name__)
@@ -57,119 +61,119 @@ scheduler = BackgroundScheduler(timezone=TZ)
 scheduler.start()
 
 # -----------------------------
-# Helpers: TZ
+# Helpers: TZ e Excel
 # -----------------------------
 def _strip_tz_inplace(df: pd.DataFrame, local_tz):
-    """
-    Remove timezone de TODAS as colunas datetime.
-    - Para dtypes datetime64[ns, tz]: converte para local_tz e tira o tz.
-    - Para colunas 'object' com datetimes tz-aware misturados: normaliza também.
-    """
-    import pandas as pd
-
-    # 1) Colunas com dtype tz-aware
+    """Remove timezone de TODAS as colunas datetime."""
+    # tz-aware dtype
     for col in df.columns:
         if pd.api.types.is_datetime64tz_dtype(df[col]):
             df[col] = df[col].dt.tz_convert(local_tz).dt.tz_localize(None)
-
-    # 2) Colunas 'object' que podem ter datetime com tz misturado
+    # objects que podem conter timestamps
     for col in df.columns:
         if df[col].dtype == "object":
             sample = df[col].dropna().head(5)
             if sample.empty:
                 continue
-
-            def _normalize_obj(x):
+            def _normalize(x):
                 if isinstance(x, pd.Timestamp):
-                    # pandas Timestamp
-                    if x.tz is not None:
-                        return x.tz_convert(local_tz).tz_localize(None).to_pydatetime()
-                    return x.to_pydatetime()
-                # tenta parsear strings/objetos em datetime
+                    return (x.tz_convert(local_tz).tz_localize(None) if x.tz is not None else x).to_pydatetime()
                 try:
                     ts = pd.to_datetime(x, errors="raise", utc=True)
-                    if pd.notna(ts):
-                        ts = ts.tz_convert(local_tz).tz_localize(None)
-                        return ts.to_pydatetime()
+                    return ts.tz_convert(local_tz).tz_localize(None).to_pydatetime()
                 except Exception:
-                    pass
-                return x
+                    return x
+            df[col] = df[col].apply(_normalize)
 
-            df[col] = df[col].apply(_normalize_obj)
+# Ordem e tradução dos campos -> cabeçalhos PT-BR
+COLUMN_ORDER = [
+    "key", "summary", "status", "assignee", "reporter",
+    "project", "issuetype", "priority", "created", "updated", "resolved"
+]
+HEADER_PTBR = {
+    "key": "ID",
+    "summary": "Resumo",
+    "status": "Status",
+    "assignee": "Responsável",
+    "reporter": "Autor",
+    "project": "Projeto",
+    "issuetype": "Tipo de Tarefa",
+    "priority": "Prioridade",
+    "created": "Criado em",
+    "updated": "Atualizado em",
+    "resolved": "Resolvido em",
+}
+
+def _apply_excel_style(writer, sheet_name: str, df_cols_ptbr: List[str]):
+    """Aplica cabeçalho moderno, bordas e formatação de datas."""
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    ws = writer.sheets[sheet_name]
+
+    # Cabeçalho
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+    for c, name in enumerate(df_cols_ptbr, 1):
+        cell = ws.cell(row=1, column=c)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.column_dimensions[get_column_letter(c)].width = max(18, len(name) + 2)
+
+    # Bordas finas
+    thin = Side(style="thin")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+        for cell in row:
+            cell.border = border
+
+    # Datas: dd/mm/yyyy hh:mm
+    date_cols = ["Criado em", "Atualizado em", "Resolvido em"]
+    for col_name in date_cols:
+        if col_name in df_cols_ptbr:
+            idx = df_cols_ptbr.index(col_name) + 1
+            for row in range(2, ws.max_row + 1):
+                ws.cell(row=row, column=idx).number_format = "dd/mm/yyyy hh:mm"
 
 # -----------------------------
 # Data Source: Jira (opcional)
 # -----------------------------
-def fetch_tasks_from_jira(
-    jql: str,
-    fields: List[str] | None = None,
-    max_results: int = 1000,
-) -> List[Dict[str, Any]]:
-    """
-    Busca issues do Jira via REST usando a JQL informada.
-    Retorna uma lista de dicionários simples, prontos para DataFrame.
-    """
+def fetch_tasks_from_jira(jql: str, fields: List[str] | None = None, max_results: int = 1000) -> List[Dict[str, Any]]:
     if not (JIRA_BASE_URL and JIRA_USER and JIRA_TOKEN):
         logger.warning("Jira não configurado; retornando lista vazia.")
         return []
-
     url = f"{JIRA_BASE_URL.rstrip('/')}/rest/api/3/search"
     headers = {"Accept": "application/json"}
     auth = (JIRA_USER, JIRA_TOKEN)
-
     if fields is None:
-        fields = [
-            "key",
-            "summary",
-            "status",
-            "assignee",
-            "reporter",
-            "project",
-            "resolutiondate",
-            "created",
-            "updated",
-            "issuetype",
-            "priority",
-        ]
+        fields = ["key","summary","status","assignee","reporter","project","resolutiondate","created","updated","issuetype","priority"]
 
-    start_at = 0
-    page_size = 100
-    items: List[Dict[str, Any]] = []
-
+    start_at, page_size, items = 0, 100, []
     while start_at < max_results:
-        payload = {
-            "jql": jql,
-            "startAt": start_at,
-            "maxResults": min(page_size, max_results - start_at),
-            "fields": fields,
-        }
+        payload = {"jql": jql, "startAt": start_at, "maxResults": min(page_size, max_results - start_at), "fields": fields}
         resp = requests.post(url, json=payload, headers=headers, auth=auth, timeout=60)
         resp.raise_for_status()
         data = resp.json()
-
         for issue in data.get("issues", []):
             f = issue.get("fields", {})
-            items.append(
-                {
-                    "key": issue.get("key"),
-                    "summary": f.get("summary"),
-                    "status": (f.get("status") or {}).get("name") if f.get("status") else None,
-                    "assignee": ((f.get("assignee") or {}).get("displayName")) if f.get("assignee") else None,
-                    "reporter": ((f.get("reporter") or {}).get("displayName")) if f.get("reporter") else None,
-                    "project": ((f.get("project") or {}).get("key")) if f.get("project") else None,
-                    "issuetype": ((f.get("issuetype") or {}).get("name")) if f.get("issuetype") else None,
-                    "priority": ((f.get("priority") or {}).get("name")) if f.get("priority") else None,
-                    "created": f.get("created"),
-                    "updated": f.get("updated"),
-                    "resolved": f.get("resolutiondate"),
-                }
-            )
-
+            items.append({
+                "key": issue.get("key"),
+                "summary": f.get("summary"),
+                "status": (f.get("status") or {}).get("name") if f.get("status") else None,
+                "assignee": (f.get("assignee") or {}).get("displayName") if f.get("assignee") else None,
+                "reporter": (f.get("reporter") or {}).get("displayName") if f.get("reporter") else None,
+                "project": (f.get("project") or {}).get("key") if f.get("project") else None,
+                "issuetype": (f.get("issuetype") or {}).get("name") if f.get("issuetype") else None,
+                "priority": (f.get("priority") or {}).get("name") if f.get("priority") else None,
+                "created": f.get("created"),
+                "updated": f.get("updated"),
+                "resolved": f.get("resolutiondate"),
+            })
         total = data.get("total", 0)
         start_at += page_size
         if start_at >= total or start_at >= max_results:
             break
-
     logger.info("Jira retornou %d itens", len(items))
     return items
 
@@ -179,164 +183,109 @@ def fetch_tasks_from_jira(
 def build_dataframe(items: List[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(items)
     if df.empty:
-        return df
+        # Garante colunas na ordem desejada
+        return pd.DataFrame(columns=COLUMN_ORDER)
 
-    # Converte strings -> datetime (UTC), ajusta para timezone local
+    # Converter para datetime (UTC -> local tz)
     for col in ["created", "updated", "resolved"]:
         if col in df.columns:
-            series = pd.to_datetime(df[col], errors="coerce", utc=True)
-            series = series.dt.tz_convert(TZ)  # fica tz-aware
-            df[col] = series
+            s = pd.to_datetime(df[col], errors="coerce", utc=True)
+            s = s.dt.tz_convert(TZ)  # tz-aware
+            df[col] = s
 
-    # Remove *qualquer* timezone do DF inteiro (Excel só aceita naive)
+    # Remover timezone completamente (Excel exige naive)
     _strip_tz_inplace(df, TZ)
 
-    # Ordenar por resolved desc, se existir
+    # Reordenar e ordenar por "resolved" (mais recente primeiro)
+    df = df[[c for c in COLUMN_ORDER if c in df.columns]]
     if "resolved" in df.columns:
         df = df.sort_values(by=["resolved"], ascending=False)
-
     return df
 
-
-def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Concluidas") -> bytes:
-    # Última defesa: remova timezone de quaisquer colunas restantes
-    _strip_tz_inplace(df, TZ)
+def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Relatório IDT") -> bytes:
+    # Títulos PT-BR e estilização
+    df_export = df.copy()
+    df_export.rename(columns=HEADER_PTBR, inplace=True)
+    _strip_tz_inplace(df_export, TZ)  # última defesa
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        if df.empty:
-            pd.DataFrame(
-                columns=[
-                    "key",
-                    "summary",
-                    "status",
-                    "assignee",
-                    "reporter",
-                    "project",
-                    "issuetype",
-                    "priority",
-                    "created",
-                    "updated",
-                    "resolved",
-                ]
-            ).to_excel(writer, index=False, sheet_name=sheet_name)
-        else:
-            df.to_excel(writer, index=False, sheet_name=sheet_name)
+        df_export.to_excel(writer, index=False, sheet_name=sheet_name)
+        _apply_excel_style(writer, sheet_name, list(df_export.columns))
     return output.getvalue()
 
 # -----------------------------
-# Envio de E-mail
+# E-mail
 # -----------------------------
-def send_mail_with_attachment(
-    subject: str,
-    body_text: str,
-    to_emails: List[str],
-    attachment_name: str,
-    attachment_bytes: bytes,
-):
+def send_mail_with_attachment(subject: str, body_text: str, to_emails: List[str], attachment_name: str, attachment_bytes: bytes):
     if not to_emails:
         raise ValueError("Lista de destinatários vazia.")
     if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS):
         raise RuntimeError("SMTP não configurado corretamente (host/port/user/pass).")
-
     msg = MIMEMultipart()
-    msg["From"] = EMAIL_FROM
-    msg["To"] = ", ".join(to_emails)
-    msg["Subject"] = subject
+    msg["From"], msg["To"], msg["Subject"] = EMAIL_FROM, ", ".join(to_emails), subject
     msg.attach(MIMEText(body_text, "plain", "utf-8"))
-
     part = MIMEBase("application", "octet-stream")
     part.set_payload(attachment_bytes)
     encoders.encode_base64(part)
     part.add_header("Content-Disposition", f"attachment; filename={attachment_name}")
     msg.attach(part)
-
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(EMAIL_FROM, to_emails, msg.as_string())
-
+        server.starttls(); server.login(SMTP_USER, SMTP_PASS); server.sendmail(EMAIL_FROM, to_emails, msg.as_string())
     logger.info("E-mail enviado para: %s", to_emails)
 
 # -----------------------------
 # Orquestração
 # -----------------------------
-def run_report_and_email(
-    days: int = 30,
-    jql: str | None = None,
-    to_emails: List[str] | None = None,
-    dry: bool = False,
-) -> Dict[str, Any]:
-    """
-    Executa o fluxo completo: busca dados (Jira, se configurado), filtra janela de 'days',
-    gera Excel, e (se dry=False) envia por e-mail. Retorna metadados da execução.
-    """
+def run_report_and_email(days: int = 30, jql: str | None = None, to_emails: List[str] | None = None, dry: bool = False) -> Dict[str, Any]:
     to_emails = to_emails or EMAIL_TO_DEFAULT
+    # Monta JQL (usa TEMPLATE + PROJECT_KEY + janela)
+    jql_final = (jql or JIRA_JQL_TEMPLATE).format(project=PROJECT_KEY, days=days)
 
-    # Monta JQL padrão caso necessário
-    jql = jql or (JIRA_JQL_DEFAULT.replace("-30d", f"-{days}d") if JIRA_JQL_DEFAULT else None)
-
-    items: List[Dict[str, Any]] = fetch_tasks_from_jira(jql) if jql else []
-
-    # Filtro defensivo por janela de dias, caso a fonte não aplique
+    items = fetch_tasks_from_jira(jql_final) if jql_final else []
+    # Filtro defensivo (caso a instância não respeite resolved>= -Nd)
     if items:
         cutoff = datetime.now(tz=TZ) - timedelta(days=days)
-        norm_items: List[Dict[str, Any]] = []
+        keep = []
         for it in items:
-            resolved_str = it.get("resolved")
-            resolved_dt = pd.to_datetime(resolved_str, errors="coerce", utc=True) if resolved_str else pd.NaT
-            if pd.notna(resolved_dt):
-                resolved_dt = resolved_dt.tz_convert(TZ)  # tz-aware
-                if resolved_dt >= cutoff:
-                    norm_items.append(it)
-        items = norm_items
+            ts = pd.to_datetime(it.get("resolved"), errors="coerce", utc=True)
+            if pd.notna(ts) and ts.tzinfo is not None:
+                ts = ts.tz_convert(TZ)
+            if pd.notna(ts) and ts >= cutoff:
+                keep.append(it)
+        items = keep
 
     df = build_dataframe(items)
     excel_bytes = dataframe_to_excel_bytes(df)
 
     now = datetime.now(tz=TZ)
-    filename = f"relatorio_tarefas_concluidas_{now.strftime('%Y%m%d_%H%M')}.xlsx"
+    filename = f"relatorio_{PROJECT_KEY.lower()}_{now.strftime('%Y%m%d_%H%M')}.xlsx"
 
     if dry:
-        return {
-            "ok": True,
-            "dry": True,
-            "rows": int(len(df.index)),
-            "filename": filename,
-        }
+        return {"ok": True, "dry": True, "rows": int(len(df.index)), "filename": filename}
 
-    subject = f"Relatório de tarefas concluídas (últimos {days} dias) - {now.strftime('%d/%m/%Y %H:%M')}"
-    body = (
-        f"Segue em anexo o relatório em Excel com tarefas concluídas nos últimos {days} dias.\n"
-        f"Gerado em {now.strftime('%d/%m/%Y %H:%M %Z')}."
-    )
+    subject = f"Relatório {PROJECT_KEY} - tarefas concluídas (últimos {days} dias) - {now.strftime('%d/%m/%Y %H:%M')}"
+    body = f"Segue em anexo o relatório em Excel do projeto {PROJECT_KEY} com tarefas concluídas nos últimos {days} dias.\nGerado em {now.strftime('%d/%m/%Y %H:%M %Z')}."
     send_mail_with_attachment(subject, body, to_emails, filename, excel_bytes)
 
-    return {
-        "ok": True,
-        "rows": int(len(df.index)),
-        "filename": filename,
-        "sent_to": to_emails,
-        "generated_at": now.isoformat(),
-    }
+    return {"ok": True, "rows": int(len(df.index)), "filename": filename, "sent_to": to_emails, "generated_at": now.isoformat()}
 
 # -----------------------------
 # API
 # -----------------------------
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "time": datetime.now(tz=TZ).isoformat()})
+    return jsonify({"status": "ok", "time": datetime.now(tz=TZ).isoformat(), "project": PROJECT_KEY})
 
 @app.post("/report/run")
 def report_run():
     data = request.get_json(silent=True) or {}
     days = int(data.get("days", 30))
-    jql = data.get("jql")
+    jql = data.get("jql")  # se enviar, sobrepõe o template
     to_emails = data.get("to")
     if isinstance(to_emails, str):
         to_emails = [e.strip() for e in to_emails.split(",") if e.strip()]
     dry = str(data.get("dry", "")).lower() in {"1", "true", "yes"}
-
     try:
         result = run_report_and_email(days=days, jql=jql, to_emails=to_emails, dry=dry)
         return jsonify(result)
@@ -347,53 +296,39 @@ def report_run():
 @app.post("/schedule/monthly")
 def schedule_monthly():
     data = request.get_json(force=True)
-    # Ex.: {"day": 1, "time": "08:30", "days": 30, "jql": "...", "to": ["a@b.com"]}
-    day = int(data.get("day", 1))  # 1-28 recomendado
+    day = int(data.get("day", 1))
     time_str = data.get("time", "09:00")
     days_window = int(data.get("days", 30))
     jql = data.get("jql")
     to_emails = data.get("to") or EMAIL_TO_DEFAULT
     if isinstance(to_emails, str):
         to_emails = [e.strip() for e in to_emails.split(",") if e.strip()]
-
-    hour, minute = map(int, time_str.split(":"))
-    job_id = data.get("job_id", f"monthly_{day:02d}_{hour:02d}{minute:02d}")
-
-    trigger = CronTrigger(day=day, hour=hour, minute=minute, timezone=TZ)
-
+    h, m = map(int, time_str.split(":"))
+    job_id = data.get("job_id", f"monthly_{day:02d}_{h:02d}{m:02d}")
+    trigger = CronTrigger(day=day, hour=h, minute=m, timezone=TZ)
     def job():
         logger.info("[JOB %s] Executando relatório mensal...", job_id)
         run_report_and_email(days=days_window, jql=jql, to_emails=to_emails)
-
-    if scheduler.get_job(job_id):
-        scheduler.remove_job(job_id)
-
+    if scheduler.get_job(job_id): scheduler.remove_job(job_id)
     scheduler.add_job(job, trigger=trigger, id=job_id, replace_existing=True)
     return jsonify({"ok": True, "job_id": job_id, "when": str(trigger)})
 
 @app.post("/schedule/daily")
 def schedule_daily():
     data = request.get_json(force=True)
-    # Ex.: {"time": "08:30", "days": 30, "jql": "...", "to": ["a@b.com"], "job_id": "diario_0830"}
     time_str = data.get("time", "09:00")
     days_window = int(data.get("days", 30))
     jql = data.get("jql")
     to_emails = data.get("to") or EMAIL_TO_DEFAULT
     if isinstance(to_emails, str):
         to_emails = [e.strip() for e in to_emails.split(",") if e.strip()]
-
-    hour, minute = map(int, time_str.split(":"))
-    job_id = data.get("job_id", f"daily_{hour:02d}{minute:02d}")
-
-    trigger = CronTrigger(hour=hour, minute=minute, timezone=TZ)
-
+    h, m = map(int, time_str.split(":"))
+    job_id = data.get("job_id", f"daily_{h:02d}{m:02d}")
+    trigger = CronTrigger(hour=h, minute=m, timezone=TZ)
     def job():
         logger.info("[JOB %s] Executando relatório diário...", job_id)
         run_report_and_email(days=days_window, jql=jql, to_emails=to_emails)
-
-    if scheduler.get_job(job_id):
-        scheduler.remove_job(job_id)
-
+    if scheduler.get_job(job_id): scheduler.remove_job(job_id)
     scheduler.add_job(job, trigger=trigger, id=job_id, replace_existing=True)
     return jsonify({"ok": True, "job_id": job_id, "when": str(trigger)})
 
@@ -401,24 +336,17 @@ def schedule_daily():
 def schedule_list():
     jobs = []
     for job in scheduler.get_jobs():
-        jobs.append(
-            {
-                "id": job.id,
-                "next_run_time": job.next_run_time.astimezone(TZ).isoformat() if job.next_run_time else None,
-                "trigger": str(job.trigger),
-            }
-        )
+        jobs.append({"id": job.id, "next_run_time": job.next_run_time.astimezone(TZ).isoformat() if job.next_run_time else None, "trigger": str(job.trigger)})
     return jsonify({"ok": True, "jobs": jobs})
 
 @app.delete("/schedule/<job_id>")
 def schedule_delete(job_id: str):
     job = scheduler.get_job(job_id)
-    if not job:
-        return jsonify({"ok": False, "error": "job_id não encontrado"}), 404
+    if not job: return jsonify({"ok": False, "error": "job_id não encontrado"}), 404
     scheduler.remove_job(job_id)
     return jsonify({"ok": True, "removed": job_id})
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    logger.info("Iniciando API na porta %d (TZ=%s)...", port, TZ)
+    logger.info("Iniciando API na porta %d (TZ=%s, PROJECT=%s)...", port, TZ, PROJECT_KEY)
     app.run(host="0.0.0.0", port=port)
