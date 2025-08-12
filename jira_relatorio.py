@@ -463,7 +463,7 @@ services:
       - key: JIRA_TOKEN
         sync: false
       - key: JIRA_JQL
-        value: statusCategory = Done AND resolved >= -30d ORDER BY resolved DESC
+        value = "statusCategory = Done AND resolved >= -30d ORDER BY resolved DESC"
 ```
 services:
   - type: web
@@ -552,3 +552,4 @@ services:
       - key: JIRA_JQL
         value: statusCategory = Done AND resolved >= -30d ORDER BY resolved DESC
 ```
+
