@@ -552,11 +552,3 @@ services:
       - key: JIRA_JQL
         value: statusCategory = Done AND resolved >= -30d ORDER BY resolved DESC
 ```
-
-### O que conferir no log do Render
-Busque pelas linhas vermelhas com `ERROR:` imediatamente **acima** de `metadata-generation-failed`. Normalmente aparece algo como:
-- `Failed building wheel for pandas` ou `for numpy`
-- `No matching distribution found for ...`
-- `subprocess-exited-with-error` durante `build_ext`
-
-Se aparecer algo desse tipo mesmo com as versões novas, me envie as **20–30 linhas antes do primeiro `ERROR:`** que eu já ajusto. 
