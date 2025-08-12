@@ -369,7 +369,7 @@ def run_report_and_email(days: int = 30, jql: str | None = None, to_emails: List
 
     subject = f"Relatório {PROJECT_KEY} - tarefas concluídas (últimos {days} dias) - {now.strftime('%d/%m/%Y %H:%M')}"
     body = (
-        f"Segue em anexo o relatório em Excel do projeto {PROJECT_KEY}, com aba 'Todos os Setores' e abas por Setor.\n"
+        f"Segue em anexo o relatório em Excel do projeto {PROJECT_KEY}.\n"
         f"Gerado em {now.strftime('%d/%m/%Y %H:%M %Z')}."
     )
     send_mail_with_attachment(subject, body, to_emails, filename, excel_bytes)
@@ -470,3 +470,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     logger.info("Iniciando API na porta %d (TZ=%s, PROJECT=%s)...", port, TZ, PROJECT_KEY)
     app.run(host="0.0.0.0", port=port)
+
