@@ -54,10 +54,10 @@ PROJECT_KEY = "IDT"
 
 # JQL fixa para o projeto IDT (NÃO usa variável de ambiente)
 JIRA_JQL_TEMPLATE = (
-    'project = IDT '
-    'AND (status = "Concluído" OR statusCategory = Done) '
-    'AND (resolved >= -{days}d OR status changed to "Concluído" after -{days}d) '
-    'ORDER BY resolved DESC, updated DESC'
+    "project = IDT "
+    "AND (status = Concluído OR statusCategory = Done) "
+    "AND (resolved >= -{days}d OR status changed to "Concluído" after -{days}d) "
+    "ORDER BY resolved DESC, updated DESC"
 )
 
 )
@@ -399,6 +399,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     logger.info("Iniciando API na porta %d (TZ=%s, PROJECT=%s)...", port, TZ, PROJECT_KEY)
     app.run(host="0.0.0.0", port=port)
+
 
 
 
