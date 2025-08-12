@@ -387,6 +387,16 @@ if __name__ == "__main__":
 Abaixo estão os arquivos prontos para você adicionar ao repositório e publicar no Render.
 
 ## requirements.txt
+```txt
+Flask==3.0.3
+gunicorn==22.0.0
+APScheduler==3.10.4
+# Compatível com Python 3.13 (wheels publicadas)
+numpy==2.1.1
+pandas==2.2.3
+openpyxl==3.1.5
+requests==2.32.3
+python-dateutil==2.9.0.post0
 ```
 Flask==3.0.3
 gunicorn==22.0.0
@@ -488,8 +498,65 @@ services:
 ```
 
 ### Dicas rápidas
-- **Fixe a versão do Python**: crie um arquivo `runtime.txt` na raiz com: `python-3.11.9`.
-  - Alternativa via IaC: no `render.yaml` acima use `pythonVersion: 3.11.9`.
-- Depois de adicionar o `runtime.txt`, vá em **Settings → Build & Deploy → Clear build cache** e faça um **Manual Deploy** para baixar as wheels corretas.
-- Mantenha `numpy` **antes** de `pandas` no `requirements.txt`.
-- Se ainda aparecer erro de wheel, migramos para deploy via **Dockerfile** (100% reprodutível).
+- Para **Python 3.13**, use `numpy>=2.1.0` e `pandas>=2.2.3`. Já deixei `numpy==2.1.1` e `pandas==2.2.3` acima.
+- Depois de alterar `requirements.txt`, faça **Clear build cache** no Render e redeploy.
+- Se ainda falhar, use o caminho **Docker** abaixo.
+
+## Dockerfile (opção segura p/ Python 3.13)
+```dockerfile
+FROM python:3.13-slim
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+# Dependências de build básicas (caso alguma lib precise)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements.txt /app/
+RUN python -V && pip install --upgrade pip setuptools wheel \
+    && pip install -r requirements.txt
+COPY . /app
+CMD gunicorn api_relatorio_tarefas:app --bind 0.0.0.0:${PORT}
+```
+
+## render.yaml (modo Docker)
+```yaml
+services:
+  - type: web
+    name: api-relatorio-tarefas
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: APP_TZ
+        value: America/Sao_Paulo
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        value: jira.coasul@gmail.com
+      - key: SMTP_PASS
+        sync: false
+      - key: EMAIL_FROM
+        value: jira.coasul@gmail.com
+      - key: EMAIL_TO
+        value: dest1@empresa.com,dest2@empresa.com
+      - key: JIRA_BASE_URL
+        value: https://<instancia>.atlassian.net
+      - key: JIRA_USER
+        value: <seu_email_no_jira>
+      - key: JIRA_TOKEN
+        sync: false
+      - key: JIRA_JQL
+        value: statusCategory = Done AND resolved >= -30d ORDER BY resolved DESC
+```
+
+### O que conferir no log do Render
+Busque pelas linhas vermelhas com `ERROR:` imediatamente **acima** de `metadata-generation-failed`. Normalmente aparece algo como:
+- `Failed building wheel for pandas` ou `for numpy`
+- `No matching distribution found for ...`
+- `subprocess-exited-with-error` durante `build_ext`
+
+Se aparecer algo desse tipo mesmo com as versões novas, me envie as **20–30 linhas antes do primeiro `ERROR:`** que eu já ajusto. 
