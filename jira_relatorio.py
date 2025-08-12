@@ -124,10 +124,11 @@ HEADER_PTBR = {
 }
 
 # -----------------------------------------------------------------------------
-# Estilo e AutoFit de colunas
+# Estilo + AutoFit de colunas
 # -----------------------------------------------------------------------------
 def _apply_excel_style(ws, df_cols_ptbr: List[str]):
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
 
     # Cabeçalho
     header_font = Font(bold=True, color="FFFFFF")
@@ -157,26 +158,39 @@ def _apply_excel_style(ws, df_cols_ptbr: List[str]):
     ws.freeze_panes = "A2"
 
     # -------- AutoFit de colunas (largura conforme conteúdo) --------
-    # Aproximação por número de caracteres (com teto/mínimo)
-    from openpyxl.utils import get_column_letter
-    MIN_W, MAX_W = 8, 60
+    # Largura mínima por coluna (em "nº de caracteres") e teto global
+    PREFERRED_MIN = {
+        "ID": 12,
+        "Resumo": 60,
+        "Status": 12,
+        "Responsável": 22,
+        "Autor": 22,
+        "Setor": 24,
+        "Filial": 28,
+        "Criado em": 19,     # "dd/mm/yyyy hh:mm" ~ 16 chars
+        "Finalizado": 19,
+    }
+    MIN_W = 8
+    MAX_W = 120  # teto bem alto pra não cortar textos grandes
 
-    for col_idx in range(1, ws.max_column + 1):
+    for col_idx, header in enumerate(df_cols_ptbr, start=1):
         column_letter = get_column_letter(col_idx)
-        max_len = 0
-        for row in range(1, ws.max_row + 1):
-            cell = ws.cell(row=row, column=col_idx)
-            val = cell.value
+        max_len = len(str(header))  # inclui o próprio cabeçalho
+        for row in range(2, ws.max_row + 1):
+            val = ws.cell(row=row, column=col_idx).value
             if val is None:
-                length = 0
-            elif isinstance(val, datetime):
-                # "dd/mm/yyyy hh:mm" ~ 16 chars
+                continue
+            if isinstance(val, datetime):
                 length = 16
             else:
-                length = len(str(val))
+                # considera quebras de linha; pega o trecho mais comprido
+                parts = str(val).splitlines()
+                length = max(len(p) for p in parts) if parts else 0
             if length > max_len:
                 max_len = length
-        ws.column_dimensions[column_letter].width = min(MAX_W, max(MIN_W, max_len + 2))
+
+        base = max(PREFERRED_MIN.get(header, MIN_W), max_len + 2)
+        ws.column_dimensions[column_letter].width = min(MAX_W, base)
     # ----------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
