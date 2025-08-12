@@ -1,3 +1,41 @@
+"""
+API Flask para gerar um relatório em Excel com tarefas concluídas nos últimos 30 dias
+(e/ou em uma janela configurável), e enviar o arquivo por e-mail. Inclui endpoints
+para execução sob demanda e para agendar execuções recorrentes (mensal/diária) via APScheduler.
+
+Requisitos (requirements.txt):
+Flask==3.0.3
+APScheduler==3.10.4
+pandas==2.2.2
+openpyxl==3.1.5
+requests==2.32.3
+python-dateutil==2.9.0.post0
+
+Execução local:
+export FLASK_ENV=development
+export SMTP_HOST=smtp.gmail.com
+export SMTP_PORT=587
+export SMTP_USER="jira.coasul@gmail.com"
+export SMTP_PASS="<sua_senha_ou_app_password>"
+export EMAIL_FROM="jira.coasul@gmail.com"
+export EMAIL_TO="dest1@empresa.com,dest2@empresa.com"
+# (Opcional) Integração com Jira Cloud/Data Center
+export JIRA_BASE_URL="https://<sua_instancia>.atlassian.net"  # ou URL DC
+export JIRA_USER="<seu_email_no_jira>"
+export JIRA_TOKEN="<api_token_ou_senha>"
+# JQL padrão: concluídas nos últimos 30 dias
+export JIRA_JQL="statusCategory = Done AND resolved >= -30d ORDER BY resolved DESC"
+
+python api_relatorio_tarefas.py
+
+Endpoints:
+GET  /health                          -> status
+POST /report/run                      -> executa agora; body opcional para override de parâmetros
+POST /schedule/monthly                -> agenda por dia do mês e horário
+POST /schedule/daily                  -> agenda diária em horário específico
+DELETE /schedule/<job_id>             -> remove agendamento
+GET  /schedule                         -> lista agendamentos
+"""
 from __future__ import annotations
 
 import io
@@ -343,3 +381,115 @@ if __name__ == "__main__":
     logger.info("Iniciando API na porta %d (TZ=%s)...", port, TZ)
     app.run(host="0.0.0.0", port=port)
 
+
+# Arquivos de deploy no Render
+
+Abaixo estão os arquivos prontos para você adicionar ao repositório e publicar no Render.
+
+## requirements.txt
+```
+Flask==3.0.3
+gunicorn==22.0.0
+APScheduler==3.10.4
+# Fix de wheels binárias estáveis (evita compile no Render)
+numpy==1.26.4
+pandas==2.2.2
+openpyxl==3.1.5
+requests==2.32.3
+python-dateutil==2.9.0.post0
+```
+
+## Procfile
+```
+web: gunicorn api_relatorio_tarefas:app --bind 0.0.0.0:$PORT
+```
+> Se renomear o arquivo Python, ajuste `api_relatorio_tarefas:app` aqui.
+
+## build.sh
+Script para garantir `pip/setuptools/wheel` atualizados antes da instalação (evita `metadata-generation-failed`).
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+python -V
+pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
+```
+
+### Como usar o `build.sh` no Render
+- **Opção A (Dashboard):** em *Build Command*, coloque: `bash build.sh`
+- **Opção B (IaC):** use `render.yaml` abaixo e faça deploy a partir dele.
+
+## render.yaml (opcional)
+```
+services:
+  - type: web
+    name: api-relatorio-tarefas
+    env: python
+    plan: free
+    buildCommand: bash build.sh
+    startCommand: gunicorn api_relatorio_tarefas:app --bind 0.0.0.0:$PORT
+    # Fixar versão do Python para evitar build de pandas/numpy
+    pythonVersion: 3.11.9
+    envVars:
+      - key: APP_TZ
+        value: America/Sao_Paulo
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        value: jira.coasul@gmail.com
+      - key: SMTP_PASS
+        sync: false  # defina no dashboard/secret store
+      - key: EMAIL_FROM
+        value: jira.coasul@gmail.com
+      - key: EMAIL_TO
+        value: dest1@empresa.com,dest2@empresa.com
+      - key: JIRA_BASE_URL
+        value: https://<instancia>.atlassian.net
+      - key: JIRA_USER
+        value: <seu_email_no_jira>
+      - key: JIRA_TOKEN
+        sync: false
+      - key: JIRA_JQL
+        value: statusCategory = Done AND resolved >= -30d ORDER BY resolved DESC
+```
+services:
+  - type: web
+    name: api-relatorio-tarefas
+    env: python
+    plan: free
+    buildCommand: bash build.sh
+    startCommand: gunicorn api_relatorio_tarefas:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: APP_TZ
+        value: America/Sao_Paulo
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        value: jira.coasul@gmail.com
+      - key: SMTP_PASS
+        sync: false  # defina no dashboard/secret store
+      - key: EMAIL_FROM
+        value: jira.coasul@gmail.com
+      - key: EMAIL_TO
+        value: dest1@empresa.com,dest2@empresa.com
+      - key: JIRA_BASE_URL
+        value: https://<instancia>.atlassian.net
+      - key: JIRA_USER
+        value: <seu_email_no_jira>
+      - key: JIRA_TOKEN
+        sync: false
+      - key: JIRA_JQL
+        value: statusCategory = Done AND resolved >= -30d ORDER BY resolved DESC
+```
+
+### Dicas rápidas
+- **Fixe a versão do Python**: crie um arquivo `runtime.txt` na raiz com: `python-3.11.9`.
+  - Alternativa via IaC: no `render.yaml` acima use `pythonVersion: 3.11.9`.
+- Depois de adicionar o `runtime.txt`, vá em **Settings → Build & Deploy → Clear build cache** e faça um **Manual Deploy** para baixar as wheels corretas.
+- Mantenha `numpy` **antes** de `pandas` no `requirements.txt`.
+- Se ainda aparecer erro de wheel, migramos para deploy via **Dockerfile** (100% reprodutível).
