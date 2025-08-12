@@ -40,13 +40,13 @@ SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
-EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER or "jira.coasul@gmail.com")
+EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER or "noreply@example.com")
 EMAIL_TO_DEFAULT = [e.strip() for e in os.getenv("EMAIL_TO", "").split(",") if e.strip()]
 
 JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
 JIRA_USER = os.getenv("JIRA_USER")
 JIRA_TOKEN = os.getenv("JIRA_TOKEN")
-# ⚠️ JQL como STRING (corrigido)
+# JQL **como string** (não remova as aspas)
 JIRA_JQL_DEFAULT = os.getenv(
     "JIRA_JQL",
     "statusCategory = Done AND resolved >= -30d ORDER BY resolved DESC",
@@ -55,6 +55,47 @@ JIRA_JQL_DEFAULT = os.getenv(
 app = Flask(__name__)
 scheduler = BackgroundScheduler(timezone=TZ)
 scheduler.start()
+
+# -----------------------------
+# Helpers: TZ
+# -----------------------------
+def _strip_tz_inplace(df: pd.DataFrame, local_tz):
+    """
+    Remove timezone de TODAS as colunas datetime.
+    - Para dtypes datetime64[ns, tz]: converte para local_tz e tira o tz.
+    - Para colunas 'object' com datetimes tz-aware misturados: normaliza também.
+    """
+    import pandas as pd
+
+    # 1) Colunas com dtype tz-aware
+    for col in df.columns:
+        if pd.api.types.is_datetime64tz_dtype(df[col]):
+            df[col] = df[col].dt.tz_convert(local_tz).dt.tz_localize(None)
+
+    # 2) Colunas 'object' que podem ter datetime com tz misturado
+    for col in df.columns:
+        if df[col].dtype == "object":
+            sample = df[col].dropna().head(5)
+            if sample.empty:
+                continue
+
+            def _normalize_obj(x):
+                if isinstance(x, pd.Timestamp):
+                    # pandas Timestamp
+                    if x.tz is not None:
+                        return x.tz_convert(local_tz).tz_localize(None).to_pydatetime()
+                    return x.to_pydatetime()
+                # tenta parsear strings/objetos em datetime
+                try:
+                    ts = pd.to_datetime(x, errors="raise", utc=True)
+                    if pd.notna(ts):
+                        ts = ts.tz_convert(local_tz).tz_localize(None)
+                        return ts.to_pydatetime()
+                except Exception:
+                    pass
+                return x
+
+            df[col] = df[col].apply(_normalize_obj)
 
 # -----------------------------
 # Data Source: Jira (opcional)
@@ -132,25 +173,25 @@ def fetch_tasks_from_jira(
     logger.info("Jira retornou %d itens", len(items))
     return items
 
-
 # -----------------------------
 # Geração de Relatório
 # -----------------------------
-def build_dataframe(items):
+def build_dataframe(items: List[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(items)
     if df.empty:
         return df
 
-    # Converte para timezone de SP e REMOVE o tz (Excel exige naive)
+    # Converte strings -> datetime (UTC), ajusta para timezone local
     for col in ["created", "updated", "resolved"]:
         if col in df.columns:
             series = pd.to_datetime(df[col], errors="coerce", utc=True)
-            # 1) UTC -> America/Sao_Paulo
-            series = series.dt.tz_convert(TZ)
-            # 2) Remove o timezone mantendo a hora local
-            series = series.dt.tz_localize(None)
+            series = series.dt.tz_convert(TZ)  # fica tz-aware
             df[col] = series
 
+    # Remove *qualquer* timezone do DF inteiro (Excel só aceita naive)
+    _strip_tz_inplace(df, TZ)
+
+    # Ordenar por resolved desc, se existir
     if "resolved" in df.columns:
         df = df.sort_values(by=["resolved"], ascending=False)
 
@@ -158,6 +199,9 @@ def build_dataframe(items):
 
 
 def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Concluidas") -> bytes:
+    # Última defesa: remova timezone de quaisquer colunas restantes
+    _strip_tz_inplace(df, TZ)
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         if df.empty:
@@ -179,7 +223,6 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Concluidas") -
         else:
             df.to_excel(writer, index=False, sheet_name=sheet_name)
     return output.getvalue()
-
 
 # -----------------------------
 # Envio de E-mail
@@ -215,7 +258,6 @@ def send_mail_with_attachment(
 
     logger.info("E-mail enviado para: %s", to_emails)
 
-
 # -----------------------------
 # Orquestração
 # -----------------------------
@@ -223,10 +265,11 @@ def run_report_and_email(
     days: int = 30,
     jql: str | None = None,
     to_emails: List[str] | None = None,
+    dry: bool = False,
 ) -> Dict[str, Any]:
     """
     Executa o fluxo completo: busca dados (Jira, se configurado), filtra janela de 'days',
-    gera Excel, envia por e-mail. Retorna metadados da execução.
+    gera Excel, e (se dry=False) envia por e-mail. Retorna metadados da execução.
     """
     to_emails = to_emails or EMAIL_TO_DEFAULT
 
@@ -242,10 +285,10 @@ def run_report_and_email(
         for it in items:
             resolved_str = it.get("resolved")
             resolved_dt = pd.to_datetime(resolved_str, errors="coerce", utc=True) if resolved_str else pd.NaT
-            if pd.notna(resolved_dt) and resolved_dt.tzinfo is not None:
-                resolved_dt = resolved_dt.tz_convert(TZ)
-            if pd.notna(resolved_dt) and resolved_dt >= cutoff:
-                norm_items.append(it)
+            if pd.notna(resolved_dt):
+                resolved_dt = resolved_dt.tz_convert(TZ)  # tz-aware
+                if resolved_dt >= cutoff:
+                    norm_items.append(it)
         items = norm_items
 
     df = build_dataframe(items)
@@ -253,21 +296,29 @@ def run_report_and_email(
 
     now = datetime.now(tz=TZ)
     filename = f"relatorio_tarefas_concluidas_{now.strftime('%Y%m%d_%H%M')}.xlsx"
+
+    if dry:
+        return {
+            "ok": True,
+            "dry": True,
+            "rows": int(len(df.index)),
+            "filename": filename,
+        }
+
     subject = f"Relatório de tarefas concluídas (últimos {days} dias) - {now.strftime('%d/%m/%Y %H:%M')}"
     body = (
         f"Segue em anexo o relatório em Excel com tarefas concluídas nos últimos {days} dias.\n"
         f"Gerado em {now.strftime('%d/%m/%Y %H:%M %Z')}."
     )
-
     send_mail_with_attachment(subject, body, to_emails, filename, excel_bytes)
 
     return {
-        "rows": len(df.index),
+        "ok": True,
+        "rows": int(len(df.index)),
         "filename": filename,
         "sent_to": to_emails,
         "generated_at": now.isoformat(),
     }
-
 
 # -----------------------------
 # API
@@ -275,7 +326,6 @@ def run_report_and_email(
 @app.get("/health")
 def health():
     return jsonify({"status": "ok", "time": datetime.now(tz=TZ).isoformat()})
-
 
 @app.post("/report/run")
 def report_run():
@@ -285,13 +335,14 @@ def report_run():
     to_emails = data.get("to")
     if isinstance(to_emails, str):
         to_emails = [e.strip() for e in to_emails.split(",") if e.strip()]
+    dry = str(data.get("dry", "")).lower() in {"1", "true", "yes"}
+
     try:
-        result = run_report_and_email(days=days, jql=jql, to_emails=to_emails)
-        return jsonify({"ok": True, **result})
+        result = run_report_and_email(days=days, jql=jql, to_emails=to_emails, dry=dry)
+        return jsonify(result)
     except Exception as e:
         logger.exception("Erro executando relatório: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
 @app.post("/schedule/monthly")
 def schedule_monthly():
@@ -320,7 +371,6 @@ def schedule_monthly():
     scheduler.add_job(job, trigger=trigger, id=job_id, replace_existing=True)
     return jsonify({"ok": True, "job_id": job_id, "when": str(trigger)})
 
-
 @app.post("/schedule/daily")
 def schedule_daily():
     data = request.get_json(force=True)
@@ -347,7 +397,6 @@ def schedule_daily():
     scheduler.add_job(job, trigger=trigger, id=job_id, replace_existing=True)
     return jsonify({"ok": True, "job_id": job_id, "when": str(trigger)})
 
-
 @app.get("/schedule")
 def schedule_list():
     jobs = []
@@ -361,7 +410,6 @@ def schedule_list():
         )
     return jsonify({"ok": True, "jobs": jobs})
 
-
 @app.delete("/schedule/<job_id>")
 def schedule_delete(job_id: str):
     job = scheduler.get_job(job_id)
@@ -370,9 +418,7 @@ def schedule_delete(job_id: str):
     scheduler.remove_job(job_id)
     return jsonify({"ok": True, "removed": job_id})
 
-
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     logger.info("Iniciando API na porta %d (TZ=%s)...", port, TZ)
     app.run(host="0.0.0.0", port=port)
-
