@@ -47,13 +47,17 @@ JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
 JIRA_USER = os.getenv("JIRA_USER")
 JIRA_TOKEN = os.getenv("JIRA_TOKEN")
 
-# Projeto padrão (ID do projeto/KEY do Jira)
+# Projeto padrão (KEY do Jira)
 PROJECT_KEY = os.getenv("PROJECT_KEY", "IDT")
 
-# JQL base (STRING!). Usamos PROJECT_KEY e janela dinâmica de dias.
+# JQL robusta: Done com resolutiondate OU transição para Done nos últimos N dias
 JIRA_JQL_TEMPLATE = os.getenv(
     "JIRA_JQL_TEMPLATE",
-    'project = {project} AND statusCategory = Done AND resolved >= -{days}d ORDER BY resolved DESC',
+    (
+        "project = {project} AND statusCategory = Done "
+        "AND (resolutiondate >= -{days}d OR status changed to Done after -{days}d) "
+        "ORDER BY resolutiondate DESC, updated DESC"
+    ),
 )
 
 app = Flask(__name__)
@@ -64,12 +68,12 @@ scheduler.start()
 # Helpers: TZ e Excel
 # -----------------------------
 def _strip_tz_inplace(df: pd.DataFrame, local_tz):
-    """Remove timezone de TODAS as colunas datetime."""
+    """Remove timezone de TODAS as colunas datetime (Excel exige naive)."""
     # tz-aware dtype
     for col in df.columns:
         if pd.api.types.is_datetime64tz_dtype(df[col]):
             df[col] = df[col].dt.tz_convert(local_tz).dt.tz_localize(None)
-    # objects que podem conter timestamps
+    # objects que podem conter timestamps tz-aware
     for col in df.columns:
         if df[col].dtype == "object":
             sample = df[col].dropna().head(5)
@@ -85,10 +89,10 @@ def _strip_tz_inplace(df: pd.DataFrame, local_tz):
                     return x
             df[col] = df[col].apply(_normalize)
 
-# Ordem e tradução dos campos -> cabeçalhos PT-BR
+# Ordem/colunas + traduções
 COLUMN_ORDER = [
-    "key", "summary", "status", "assignee", "reporter",
-    "project", "issuetype", "priority", "created", "updated", "resolved"
+    "key","summary","status","assignee","reporter",
+    "project","issuetype","priority","created","updated","resolved"
 ]
 HEADER_PTBR = {
     "key": "ID",
@@ -105,13 +109,9 @@ HEADER_PTBR = {
 }
 
 def _apply_excel_style(writer, sheet_name: str, df_cols_ptbr: List[str]):
-    """Aplica cabeçalho moderno, bordas e formatação de datas."""
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
-
     ws = writer.sheets[sheet_name]
-
-    # Cabeçalho
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
     for c, name in enumerate(df_cols_ptbr, 1):
@@ -120,24 +120,19 @@ def _apply_excel_style(writer, sheet_name: str, df_cols_ptbr: List[str]):
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center", vertical="center")
         ws.column_dimensions[get_column_letter(c)].width = max(18, len(name) + 2)
-
-    # Bordas finas
     thin = Side(style="thin")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
         for cell in row:
             cell.border = border
-
-    # Datas: dd/mm/yyyy hh:mm
-    date_cols = ["Criado em", "Atualizado em", "Resolvido em"]
-    for col_name in date_cols:
+    for col_name in ["Criado em", "Atualizado em", "Resolvido em"]:
         if col_name in df_cols_ptbr:
             idx = df_cols_ptbr.index(col_name) + 1
-            for row in range(2, ws.max_row + 1):
-                ws.cell(row=row, column=idx).number_format = "dd/mm/yyyy hh:mm"
+            for r in range(2, ws.max_row + 1):
+                ws.cell(row=r, column=idx).number_format = "dd/mm/yyyy hh:mm"
 
 # -----------------------------
-# Data Source: Jira (opcional)
+# Jira
 # -----------------------------
 def fetch_tasks_from_jira(jql: str, fields: List[str] | None = None, max_results: int = 1000) -> List[Dict[str, Any]]:
     if not (JIRA_BASE_URL and JIRA_USER and JIRA_TOKEN):
@@ -148,7 +143,6 @@ def fetch_tasks_from_jira(jql: str, fields: List[str] | None = None, max_results
     auth = (JIRA_USER, JIRA_TOKEN)
     if fields is None:
         fields = ["key","summary","status","assignee","reporter","project","resolutiondate","created","updated","issuetype","priority"]
-
     start_at, page_size, items = 0, 100, []
     while start_at < max_results:
         payload = {"jql": jql, "startAt": start_at, "maxResults": min(page_size, max_results - start_at), "fields": fields}
@@ -178,36 +172,29 @@ def fetch_tasks_from_jira(jql: str, fields: List[str] | None = None, max_results
     return items
 
 # -----------------------------
-# Geração de Relatório
+# Relatório
 # -----------------------------
 def build_dataframe(items: List[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(items)
     if df.empty:
-        # Garante colunas na ordem desejada
         return pd.DataFrame(columns=COLUMN_ORDER)
-
     # Converter para datetime (UTC -> local tz)
     for col in ["created", "updated", "resolved"]:
         if col in df.columns:
             s = pd.to_datetime(df[col], errors="coerce", utc=True)
             s = s.dt.tz_convert(TZ)  # tz-aware
             df[col] = s
-
-    # Remover timezone completamente (Excel exige naive)
+    # Remover timezone (Excel)
     _strip_tz_inplace(df, TZ)
-
-    # Reordenar e ordenar por "resolved" (mais recente primeiro)
+    # Reordenar e ordenar por "resolved" (NaT vão pro fim)
     df = df[[c for c in COLUMN_ORDER if c in df.columns]]
     if "resolved" in df.columns:
         df = df.sort_values(by=["resolved"], ascending=False)
     return df
 
 def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Relatório IDT") -> bytes:
-    # Títulos PT-BR e estilização
-    df_export = df.copy()
-    df_export.rename(columns=HEADER_PTBR, inplace=True)
-    _strip_tz_inplace(df_export, TZ)  # última defesa
-
+    df_export = df.copy().rename(columns=HEADER_PTBR)
+    _strip_tz_inplace(df_export, TZ)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_export.to_excel(writer, index=False, sheet_name=sheet_name)
@@ -239,20 +226,30 @@ def send_mail_with_attachment(subject: str, body_text: str, to_emails: List[str]
 # -----------------------------
 def run_report_and_email(days: int = 30, jql: str | None = None, to_emails: List[str] | None = None, dry: bool = False) -> Dict[str, Any]:
     to_emails = to_emails or EMAIL_TO_DEFAULT
-    # Monta JQL (usa TEMPLATE + PROJECT_KEY + janela)
     jql_final = (jql or JIRA_JQL_TEMPLATE).format(project=PROJECT_KEY, days=days)
 
     items = fetch_tasks_from_jira(jql_final) if jql_final else []
-    # Filtro defensivo (caso a instância não respeite resolved>= -Nd)
+
+    # Filtro defensivo:
+    # 1) Preferimos resolved; 2) se não houver resolved, caímos para updated.
     if items:
         cutoff = datetime.now(tz=TZ) - timedelta(days=days)
         keep = []
         for it in items:
-            ts = pd.to_datetime(it.get("resolved"), errors="coerce", utc=True)
-            if pd.notna(ts) and ts.tzinfo is not None:
-                ts = ts.tz_convert(TZ)
-            if pd.notna(ts) and ts >= cutoff:
-                keep.append(it)
+            resolved_dt = pd.to_datetime(it.get("resolved"), errors="coerce", utc=True)
+            if pd.notna(resolved_dt):
+                if resolved_dt.tzinfo is not None:
+                    resolved_dt = resolved_dt.tz_convert(TZ)
+                if resolved_dt >= cutoff:
+                    keep.append(it)
+                continue
+            # fallback pelo updated (muitas issues Done não têm resolutiondate)
+            updated_dt = pd.to_datetime(it.get("updated"), errors="coerce", utc=True)
+            if pd.notna(updated_dt):
+                if updated_dt.tzinfo is not None:
+                    updated_dt = updated_dt.tz_convert(TZ)
+                if updated_dt >= cutoff:
+                    keep.append(it)
         items = keep
 
     df = build_dataframe(items)
@@ -281,7 +278,7 @@ def health():
 def report_run():
     data = request.get_json(silent=True) or {}
     days = int(data.get("days", 30))
-    jql = data.get("jql")  # se enviar, sobrepõe o template
+    jql = data.get("jql")  # sobrepõe template se vier
     to_emails = data.get("to")
     if isinstance(to_emails, str):
         to_emails = [e.strip() for e in to_emails.split(",") if e.strip()]
