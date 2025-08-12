@@ -52,14 +52,15 @@ JIRA_TOKEN = os.getenv("JIRA_TOKEN")
 # --------------------------------
 PROJECT_KEY = "IDT"
 
-# JQL fixa para o projeto IDT (NÃO usa variável de ambiente)
+# JQL fixa para o projeto IDT:
+# - aceita status = "Concluído" (nome PT-BR do seu fluxo, entre aspas)
+# - ou categoria de status Done (inglês, não traduzida)
+# - janela por resolved OU transição para "Concluído"
 JIRA_JQL_TEMPLATE = (
-    "project = IDT "
-    "AND (status = Concluído OR statusCategory = Done) "
-    "AND (resolved >= -{days}d OR status changed to "Concluído" after -{days}d) "
-    "ORDER BY resolved DESC, updated DESC"
-)
-
+    'project = IDT '
+    'AND (status = "Concluído" OR statusCategory = Done) '
+    'AND (resolved >= -{days}d OR status changed to "Concluído" after -{days}d) '
+    'ORDER BY resolved DESC, updated DESC'
 )
 
 app = Flask(__name__)
@@ -149,6 +150,7 @@ def fetch_tasks_from_jira(jql: str, fields: List[str] | None = None, max_results
     if not (JIRA_BASE_URL and JIRA_USER and JIRA_TOKEN):
         logger.warning("Jira não configurado; retornando lista vazia.")
         return []
+
     url = f"{JIRA_BASE_URL.rstrip('/')}/rest/api/3/search"
     headers = {"Accept": "application/json"}
     auth = (JIRA_USER, JIRA_TOKEN)
@@ -167,8 +169,17 @@ def fetch_tasks_from_jira(jql: str, fields: List[str] | None = None, max_results
             "maxResults": min(page_size, max_results - start_at),
             "fields": fields,
         }
-        resp = requests.post(url, json=payload, headers=headers, auth=auth, timeout=60)
-        resp.raise_for_status()
+        try:
+            resp = requests.post(url, json=payload, headers=headers, auth=auth, timeout=60)
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            try:
+                err_body = e.response.json()
+            except Exception:
+                err_body = getattr(e.response, "text", str(e))
+            logger.error("Jira search %s. JQL=%s | payload=%s | error=%s", status, jql, payload, err_body)
+            raise
         data = resp.json()
 
         for issue in data.get("issues", []):
@@ -399,10 +410,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     logger.info("Iniciando API na porta %d (TZ=%s, PROJECT=%s)...", port, TZ, PROJECT_KEY)
     app.run(host="0.0.0.0", port=port)
-
-
-
-
-
-
-
