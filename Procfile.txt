@@ -1,1 +1,1 @@
-web: gunicorn api_relatorio_tarefas:app --bind 0.0.0.0:$PORT
+web: gunicorn jira_relatorio:app --bind 0.0.0.0:$PORT
