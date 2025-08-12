@@ -40,7 +40,7 @@ SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
-EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER or "noreply@example.com")
+EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER or "jira.coasul@gmail.com")
 EMAIL_TO_DEFAULT = [e.strip() for e in os.getenv("EMAIL_TO", "").split(",") if e.strip()]
 
 JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
@@ -136,18 +136,21 @@ def fetch_tasks_from_jira(
 # -----------------------------
 # Geração de Relatório
 # -----------------------------
-def build_dataframe(items: List[Dict[str, Any]]) -> pd.DataFrame:
+def build_dataframe(items):
     df = pd.DataFrame(items)
     if df.empty:
         return df
 
-    # Conversões de data
+    # Converte para timezone de SP e REMOVE o tz (Excel exige naive)
     for col in ["created", "updated", "resolved"]:
         if col in df.columns:
             series = pd.to_datetime(df[col], errors="coerce", utc=True)
-            df[col] = series.dt.tz_convert(TZ)
+            # 1) UTC -> America/Sao_Paulo
+            series = series.dt.tz_convert(TZ)
+            # 2) Remove o timezone mantendo a hora local
+            series = series.dt.tz_localize(None)
+            df[col] = series
 
-    # Ordenar por resolved desc, se existir
     if "resolved" in df.columns:
         df = df.sort_values(by=["resolved"], ascending=False)
 
@@ -372,3 +375,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     logger.info("Iniciando API na porta %d (TZ=%s)...", port, TZ)
     app.run(host="0.0.0.0", port=port)
+
