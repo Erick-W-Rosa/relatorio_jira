@@ -39,6 +39,9 @@ JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
 JIRA_USER = os.getenv("JIRA_USER")
 JIRA_TOKEN = os.getenv("JIRA_TOKEN")
 
+# Endpoint novo (Enhanced JQL)
+JIRA_SEARCH_URL = f"{(JIRA_BASE_URL or '').rstrip('/')}/rest/api/3/search/jql"
+
 # Projeto fixo
 PROJECT_KEY = "IDT"
 
@@ -99,7 +102,7 @@ def _strip_tz_inplace(df: pd.DataFrame, local_tz):
             df[col] = df[col].apply(_normalize)
 
 def _sanitize_sheet_name(name: str) -> str:
-    """Planilha Excel: máx 31 chars e sem : \ / ? * [ ]"""
+    r"""Planilha Excel: máx 31 chars e sem : \ / ? * [ ]"""
     name = name or "Sem Setor"
     name = re.sub(r'[:\\/\?\*\[\]]', "-", name)
     return name[:31]
@@ -158,7 +161,6 @@ def _apply_excel_style(ws, df_cols_ptbr: List[str]):
     ws.freeze_panes = "A2"
 
     # -------- AutoFit de colunas (largura conforme conteúdo) --------
-    # Largura mínima por coluna (em "nº de caracteres") e teto global
     PREFERRED_MIN = {
         "ID": 12,
         "Resumo": 60,
@@ -167,15 +169,15 @@ def _apply_excel_style(ws, df_cols_ptbr: List[str]):
         "Autor": 22,
         "Setor": 24,
         "Filial": 28,
-        "Criado em": 19,     # "dd/mm/yyyy hh:mm" ~ 16 chars
+        "Criado em": 19,
         "Finalizado": 19,
     }
     MIN_W = 8
-    MAX_W = 120  # teto bem alto pra não cortar textos grandes
+    MAX_W = 120
 
     for col_idx, header in enumerate(df_cols_ptbr, start=1):
         column_letter = get_column_letter(col_idx)
-        max_len = len(str(header))  # inclui o próprio cabeçalho
+        max_len = len(str(header))
         for row in range(2, ws.max_row + 1):
             val = ws.cell(row=row, column=col_idx).value
             if val is None:
@@ -183,7 +185,6 @@ def _apply_excel_style(ws, df_cols_ptbr: List[str]):
             if isinstance(val, datetime):
                 length = 16
             else:
-                # considera quebras de linha; pega o trecho mais comprido
                 parts = str(val).splitlines()
                 length = max(len(p) for p in parts) if parts else 0
             if length > max_len:
@@ -194,30 +195,49 @@ def _apply_excel_style(ws, df_cols_ptbr: List[str]):
     # ----------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
-# Jira
+# Jira (Enhanced JQL /search/jql)
 # -----------------------------------------------------------------------------
-def fetch_tasks_from_jira(jql: str, fields: List[str] | None = None, max_results: int = 2000) -> List[Dict[str, Any]]:
+def fetch_tasks_from_jira(jql: str) -> List[Dict[str, Any]]:
+    """
+    Busca issues usando o endpoint Enhanced JQL (/rest/api/3/search/jql),
+    paginando com nextPageToken e já solicitando os campos necessários.
+    """
     if not (JIRA_BASE_URL and JIRA_USER and JIRA_TOKEN):
         logger.warning("Jira não configurado; retornando lista vazia.")
         return []
 
-    url = f"{JIRA_BASE_URL.rstrip('/')}/rest/api/3/search"
     headers = {"Accept": "application/json"}
     auth = (JIRA_USER, JIRA_TOKEN)
 
-    if fields is None:
-        fields = [
-            "key", "summary", "status", "assignee", "reporter",
-            "created", "updated", "resolutiondate",
-            "issuetype", "priority", "project",
-            CF_SETOR, CF_FINALIZADO, CF_FILIAL,
-        ]
+    wanted_fields = [
+        "key", "summary", "status", "assignee", "reporter",
+        "created", "updated", "resolutiondate",
+        "issuetype", "priority", "project",
+        CF_SETOR, CF_FINALIZADO, CF_FILIAL,
+    ]
 
-    start_at, page_size, items = 0, 100, []
-    while start_at < max_results:
-        payload = {"jql": jql, "startAt": start_at, "maxResults": min(page_size, max_results - start_at), "fields": fields}
+    params_base = {
+        "jql": jql,
+        "fields": ",".join(wanted_fields),
+        "maxResults": 100,  # pode ser ignorado, paginação real é via nextPageToken
+    }
+
+    items: List[Dict[str, Any]] = []
+    next_token: str | None = None
+
+    while True:
+        params = dict(params_base)
+        if next_token:
+            params["nextPageToken"] = next_token
+
+        resp = requests.get(
+            JIRA_SEARCH_URL,
+            headers=headers,
+            auth=auth,
+            params=params,
+            timeout=60,
+        )
         try:
-            resp = requests.post(url, json=payload, headers=headers, auth=auth, timeout=60)
             resp.raise_for_status()
         except requests.HTTPError as e:
             status = getattr(e.response, "status_code", None)
@@ -225,12 +245,15 @@ def fetch_tasks_from_jira(jql: str, fields: List[str] | None = None, max_results
                 err_body = e.response.json()
             except Exception:
                 err_body = getattr(e.response, "text", str(e))
-            logger.error("Jira search %s. JQL=%s | payload=%s | error=%s", status, jql, payload, err_body)
+            logger.error(
+                "Jira search %s. JQL=%s | params=%s | error=%s",
+                status, jql, params, err_body
+            )
             raise
 
         data = resp.json()
         for issue in data.get("issues", []):
-            f = issue.get("fields", {})
+            f = issue.get("fields", {}) or {}
             items.append({
                 "key": issue.get("key"),
                 "summary": f.get("summary"),
@@ -245,9 +268,8 @@ def fetch_tasks_from_jira(jql: str, fields: List[str] | None = None, max_results
                 "filial": _normalize_cf(f.get(CF_FILIAL)),
             })
 
-        total = data.get("total", 0)
-        start_at += page_size
-        if start_at >= total or start_at >= max_results:
+        next_token = data.get("nextPageToken")
+        if not next_token:
             break
 
     logger.info("Jira retornou %d itens", len(items))
@@ -470,4 +492,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     logger.info("Iniciando API na porta %d (TZ=%s, PROJECT=%s)...", port, TZ, PROJECT_KEY)
     app.run(host="0.0.0.0", port=port)
-
